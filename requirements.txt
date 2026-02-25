@@ -10,3 +10,4 @@ google-cloud-aiplatform
 google-cloud-speech
 reportlab
 weasyprint
+cryptography==42.0.5

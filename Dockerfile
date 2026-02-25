@@ -25,7 +25,7 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
 # 6. Copiar todo o resto do seu código
-COPY main.py .
+COPY . .
 
 # 7. Definir a porta padrão que o Cloud Run usará
 ENV PORT 8080
