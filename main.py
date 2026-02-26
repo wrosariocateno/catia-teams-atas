@@ -7,13 +7,15 @@ from flask import Flask, jsonify, redirect, make_response, request
 from urllib.parse import unquote
 
 # Importações explícitas dos módulos refatorados
-# Certifique-se de que esses arquivos (config.py, utils.py, etc.) estejam no mesmo diretório
 from config import *
 from utils import sign_payload, verify_and_load
 from msal_auth import build_cache, build_msal_app, acquire_delegated_token, save_cache
 from graph_api import graph_get_json, get_participants_from_meeting, download_driveitem_to_tmp, send_email_graph
 from audio_processing import extract_audio_wav, transcribe_wav_chunked
 from gemini_ata import generate_minutes_with_gemini, generate_pdf_minutes
+
+# NOVO MÓDULO DE CONVIDADOS
+from meeting_guests import get_meeting_guests
 
 app = Flask(__name__)
 
@@ -90,6 +92,102 @@ def whoami():
 # Rotas de Busca e Operação
 # ----------------------------
 
+@app.post("/auto-process-latest")
+def auto_process_latest():
+    """
+    Encontra o último vídeo .mp4 não processado, gera a ata e envia por e-mail.
+    """
+    user_key = request.args.get("user")
+    token, err = acquire_delegated_token(user_key)
+    if err: return jsonify({"error": err}), 401
+
+    language = request.args.get("language", "pt-BR")
+
+    try:
+        # 1. Buscar arquivos MP4 recentes
+        search_url = f"{GRAPH_BASE_URL}/search/query"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        search_body = {
+            "requests": [{
+                "entityTypes": ["driveItem"],
+                "query": {"queryString": "filetype:mp4"},
+                "from": 0, "size": 10,
+                "fields": ["id", "name", "description", "parentReference", "onlineMeetingInfo"]
+            }]
+        }
+        
+        r_search = requests.post(search_url, headers=headers, json=search_body, timeout=HTTP_TIMEOUT)
+        r_search.raise_for_status()
+        
+        hits = r_search.json().get("value", [{}])[0].get("hitsContainers", [{}])[0].get("hits", [])
+        
+        target_item = None
+        for h in hits:
+            res = h.get("resource", {})
+            # Verificamos se a descrição contém nossa "tag" de processado
+            description = res.get("description") or ""
+            if "PROCESSED_BY_CATIA" not in description:
+                target_item = res
+                break
+        
+        if not target_item:
+            return jsonify({"status": "no_new_files", "message": "Nenhum vídeo novo para processar."}), 200
+
+        # 2. Extrair dados do item encontrado
+        drive_id = target_item.get("parentReference", {}).get("driveId")
+        item_id = target_item.get("id")
+        name = target_item.get("name")
+        join_url = target_item.get("onlineMeetingInfo", {}).get("joinUrl")
+        
+        log_debug(f"Processando automaticamente: {name} (ID: {item_id})")
+
+        # 3. Buscar convidados
+        lista_emails = get_meeting_guests(token, join_url, name)
+        if not lista_emails:
+            # Fallback: Se não achar convidados, envia para o próprio usuário logado
+            lista_emails = [user_key]
+        
+        destinatarios_str = "; ".join(lista_emails)
+
+        # 4. Processamento (Download -> Transcrição -> Gemini -> PDF)
+        mp4_path = f"/tmp/auto_{item_id}.mp4"
+        download_driveitem_to_tmp(token, drive_id, item_id, tmp_path=mp4_path)
+        wav_path = extract_audio_wav(mp4_path)
+        transcript = transcribe_wav_chunked(wav_path, language_code=language)
+        
+        #participants = get_participants_from_meeting(token, join_url) if join_url else "Não identificados"
+        participants = destinatarios_str
+
+        minutes_text = generate_minutes_with_gemini(
+            transcript=transcript, 
+            meeting_title=name, 
+            meeting_url="Link automático", 
+            participants=participants
+        )
+
+        pdf_path = f"/tmp/ata_auto_{item_id}.pdf"
+        generate_pdf_minutes(minutes_text, out_path=pdf_path, title=f"Ata: {name}")
+
+        # 5. Enviar E-mail
+        email_body = f"Olá,\n\nEsta é uma ata gerada automaticamente para a reunião: {name}\n\nO PDF segue em anexo."
+        send_email_graph(token, to_email=destinatarios_str, subject=f"Ata Automática: {name}", body_text=email_body, attachment_path=pdf_path)
+
+        # 6. MARCAR COMO PROCESSADO (A "Tag")
+        # Atualizamos a descrição do arquivo no SharePoint/OneDrive para não repetir
+        patch_url = f"{GRAPH_BASE_URL}/drives/{drive_id}/items/{item_id}"
+        patch_body = {"description": "PROCESSED_BY_CATIA - Ata enviada com sucesso."}
+        requests.patch(patch_url, headers=headers, json=patch_body, timeout=HTTP_TIMEOUT)
+
+        return jsonify({
+            "status": "success",
+            "file_processed": name,
+            "sent_to": destinatarios_str
+        }), 200
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
 @app.get("/shared-search-teste")
 def shared_search_teste():
     raw_user = request.args.get("user", "")
@@ -165,8 +263,8 @@ def generate_minutes_and_email():
     subject = (payload.get("subject") or "Ata automática").strip()
     language = (payload.get("language") or "pt-BR").strip()
 
-    if not all([drive_id, item_id, to_email]):
-        return jsonify({"error": "Parâmetros driveId, itemId e to são obrigatórios."}), 400
+    if not drive_id or not item_id:
+        return jsonify({"error": "Parâmetros driveId e itemId são obrigatórios."}), 400
 
     try:
         meta_url = f"{GRAPH_BASE_URL}/drives/{drive_id}/items/{item_id}?$select=id,name,webUrl,onlineMeetingInfo"
@@ -174,8 +272,20 @@ def generate_minutes_and_email():
         name = item.get("name")
         web_url = item.get("webUrl")
         join_url = item.get("onlineMeetingInfo", {}).get("joinUrl")
-        participants = get_participants_from_meeting(token, join_url) if join_url else "Não identificados"
+        participants = get_meeting_guests(token, join_url, name) if join_url else "Não identificados"
 
+        lista_emails_reuniao = get_meeting_guests(token, join_url, name)
+        todos_destinatarios = set(lista_emails_reuniao)
+        
+        if to_email:
+            for email_avulso in to_email.replace(',', ';').split(';'):
+                if email_avulso.strip():
+                    todos_destinatarios.add(email_avulso.strip())
+
+        if not todos_destinatarios:
+             return jsonify({"error": "Não foi possível encontrar convidados."}), 400
+
+        destinatarios_str = "; ".join(todos_destinatarios)
         mp4_path = f"/tmp/{item_id}.mp4"
         download_driveitem_to_tmp(token, drive_id, item_id, tmp_path=mp4_path)
         wav_path = extract_audio_wav(mp4_path)
@@ -198,12 +308,9 @@ def generate_minutes_and_email():
             "O arquivo PDF segue em anexo."
         )
 
-        send_email_graph(
-            token, to_email=to_email, subject=subject, 
-            body_text=email_body, attachment_path=pdf_path
-        )
+        send_email_graph(token, to_email=destinatarios_str, subject=subject, body_text=email_body, attachment_path=pdf_path)
 
-        return jsonify({"status": "sucesso", "email_enviado_para": to_email}), 200
+        return jsonify({"status": "sucesso", "email_enviado_para": destinatarios_str}), 200
 
     except Exception as e:
         traceback.print_exc()
@@ -248,7 +355,5 @@ def handle_exception(e):
     }), 500)
 
 if __name__ == "__main__":
-    # O Cloud Run requer que o servidor escute em 0.0.0.0 na porta definida pela ENV $PORT
     port = int(os.environ.get("PORT", 8080))
-    print(f">>> Iniciando Flask na porta {port}...")
     app.run(host="0.0.0.0", port=port, debug=False)

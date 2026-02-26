@@ -70,5 +70,13 @@ echo "--------------------------------"
 
 #curl -v -H "Authorization: Bearer $(gcloud auth print-identity-token)" 'https://catia-teams-atas2-697553333263.southamerica-east1.run.app/shared-search-teste?limit=60&q=Grava%C3%A7%C3%A3o%20de%20Reuni%C3%A3o%20mp4&user=william.rosario@prestadores.cateno.com.br'
 
-curl -i -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
-  "$APP_URL/shared-search-teste?limit=60&q=Grava%C3%A7%C3%A3o%20de%20Reuni%C3%A3o%20mp4&user=$ACTIVE_ACCOUNT" | jq .
+#curl -v -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
+#  "$APP_URL/shared-search-teste?limit=60&q=Grava%C3%A7%C3%A3o%20de%20Reuni%C3%A3o%20mp4&user=$ACTIVE_ACCOUNT" | jq .
+
+echo "--------------------------------"
+echo "APP_URL: $APP_URL"
+echo "Enviado de forma automatica..."
+echo "--------------------------------"
+
+curl -v -X POST -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
+  "$APP_URL/auto-process-latest?user=$ACTIVE_ACCOUNT&language=pt-BR" | jq .  
